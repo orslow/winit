@@ -445,7 +445,8 @@ declare_class!(
                 let preedit_before =
                     self.ivars().preedit_before_key_event.borrow().clone();
 
-                if !preedit_before.is_empty()
+                if self.ivars().in_key_event.get()
+                    && !preedit_before.is_empty()
                     && string.len() > preedit_before.len()
                     && string.starts_with(&preedit_before)
                 {
@@ -568,17 +569,13 @@ declare_class!(
 
                 // End key event — emit the final deferred preedit state.
                 self.ivars().in_key_event.set(false);
+                *self.ivars().preedit_before_key_event.borrow_mut() = String::new();
                 if let Some((string, cursor_range)) =
                     self.ivars().deferred_preedit.borrow_mut().take()
                 {
                     self.queue_event(WindowEvent::Ime(Ime::Preedit(string, cursor_range)));
                 }
 
-                // If the text was committed we must treat the next keyboard event as IME related.
-                if self.ivars().ime_state.get() == ImeState::Committed {
-                    // Remove any marked text, so normal input can continue.
-                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
-                }
             }
 
             self.update_modifiers(&replaced_event, false);
