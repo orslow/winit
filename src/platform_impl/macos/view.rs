@@ -131,6 +131,21 @@ pub struct ViewState {
     /// to the application, even during IME
     forward_key_to_app: Cell<bool>,
 
+    /// True while inside `interpretKeyEvents` within `keyDown`.
+    in_key_event: Cell<bool>,
+
+    /// Deferred preedit event from `setMarkedText` during `keyDown`.
+    deferred_preedit: RefCell<Option<(String, Option<(usize, usize)>)>>,
+
+    /// Preedit content saved before `interpretKeyEvents` in `keyDown`.
+    preedit_before_key_event: RefCell<String>,
+
+    /// True when `insertText` detects a non-ASCII character in Ground state
+    /// without marked text, indicating the IME bypassed composition (e.g.,
+    /// input source was switched via a key that macOS intercepted, so neither
+    /// keyDown nor flagsChanged detected the change).
+    needs_redispatch: Cell<bool>,
+
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
 
@@ -330,8 +345,16 @@ declare_class!(
                 Some((lowerbound_utf8, upperbound_utf8))
             };
 
-            // Send WindowEvent for updating marked text
-            self.queue_event(WindowEvent::Ime(Ime::Preedit(string.to_string(), cursor_range)));
+            // Defer preedit during keyDown — only the final state is emitted.
+            if self.ivars().in_key_event.get() {
+                *self.ivars().deferred_preedit.borrow_mut() =
+                    Some((string.to_string(), cursor_range));
+            } else {
+                self.queue_event(WindowEvent::Ime(Ime::Preedit(
+                    string.to_string(),
+                    cursor_range,
+                )));
+            }
         }
 
         #[method(unmarkText)]
@@ -409,21 +432,92 @@ declare_class!(
 
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
+                *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                *self.ivars().deferred_preedit.borrow_mut() = None;
+
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
-                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+
+                let preedit_before =
+                    self.ivars().preedit_before_key_event.borrow().clone();
+
+                if self.ivars().in_key_event.get()
+                    && !preedit_before.is_empty()
+                    && string.len() > preedit_before.len()
+                    && string.starts_with(&preedit_before)
+                {
+                    self.queue_event(WindowEvent::Ime(Ime::Commit(preedit_before)));
+                    self.ivars().forward_key_to_app.set(true);
+                } else {
+                    self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                }
                 self.ivars().ime_state.set(ImeState::Committed);
+            } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
+                if self.ivars().in_key_event.get()
+                    && self.ivars().ime_allowed.get()
+                    && !string.is_ascii()
+                    && !unsafe { self.hasMarkedText() }
+                {
+                    // Korean IME was reset by a round-trip input source switch
+                    // (e.g., Korean → English → Korean without typing). The IME
+                    // sent a committed character when it should be composing.
+                    // Transition to Ground and request re-dispatch.
+                    self.ivars().ime_state.set(ImeState::Ground);
+                    self.ivars().needs_redispatch.set(true);
+                } else {
+                    self.ivars().forward_key_to_app.set(true);
+                }
+            } else if self.ivars().ime_state.get() == ImeState::Disabled
+                && self.ivars().ime_allowed.get()
+                && !is_control
+                && !string.is_ascii()
+            {
+                // Apple Korean IME bug workaround: after switching input sources,
+                // the first character arrives via insertText instead of setMarkedText.
+                // Enable IME and request re-dispatch.
+                self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                self.ivars().ime_state.set(ImeState::Ground);
+            } else if self.ivars().ime_state.get() == ImeState::Ground
+                && self.ivars().in_key_event.get()
+                && self.ivars().ime_allowed.get()
+                && !is_control
+                && !string.is_ascii()
+                && !unsafe { self.hasMarkedText() }
+            {
+                // Input source was switched via a key that macOS intercepted
+                // (e.g., F18, globe key), so neither keyDown nor flagsChanged
+                // detected the change. The IME sent a committed character when
+                // it should be composing. Request re-dispatch.
+                self.ivars().needs_redispatch.set(true);
             }
         }
 
         // Basically, we're sent this message whenever a keyboard event that doesn't generate a "human
         // readable" character happens, i.e. newlines, tabs, and Ctrl+C.
         #[method(doCommandBySelector:)]
-        fn do_command_by_selector(&self, _command: Sel) {
+        fn do_command_by_selector(&self, command: Sel) {
             trace_scope!("doCommandBySelector:");
-            // We shouldn't forward any character from just committed text, since we'll end up sending
-            // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
-            // which is not desired given it was used to confirm IME input.
+
+            // Don't forward most commands from just committed text (would double-send).
+            // Exception: delete commands must pass through for single jamo backspace.
             if self.ivars().ime_state.get() == ImeState::Committed {
+                if command == sel!(deleteBackward:)
+                    || command == sel!(deleteForward:)
+                    || command == sel!(deleteWordBackward:)
+                    || command == sel!(deleteWordForward:)
+                {
+                    self.ivars().forward_key_to_app.set(true);
+                }
+                return;
+            }
+
+            // If the IME cleared the preedit during this key event (e.g.,
+            // backspace deleting the last composing character), the key was
+            // consumed by the IME. Don't forward it to the application.
+            // See: Ghostty commit e5e89bcbe (issue #7225).
+            if self.ivars().in_key_event.get()
+                && !self.ivars().preedit_before_key_event.borrow().is_empty()
+                && !unsafe { self.hasMarkedText() }
+            {
                 return;
             }
 
@@ -444,11 +538,13 @@ declare_class!(
             {
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
-                if *prev_input_source != current_input_source && self.is_ime_enabled() {
+                if *prev_input_source != current_input_source {
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
-                    self.ivars().ime_state.set(ImeState::Disabled);
-                    self.queue_event(WindowEvent::Ime(Ime::Disabled));
+                    if self.is_ime_enabled() {
+                        self.ivars().ime_state.set(ImeState::Disabled);
+                        self.queue_event(WindowEvent::Ime(Ime::Disabled));
+                    }
                 }
             }
 
@@ -464,13 +560,38 @@ declare_class!(
             // `doCommandBySelector`. (doCommandBySelector means that the keyboard input
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_allowed.get() {
+                self.ivars().in_key_event.set(true);
+                *self.ivars().deferred_preedit.borrow_mut() = None;
+                *self.ivars().preedit_before_key_event.borrow_mut() =
+                    self.ivars().marked_text.borrow().string().to_string();
+
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
 
-                // If the text was committed we must treat the next keyboard event as IME related.
-                if self.ivars().ime_state.get() == ImeState::Committed {
-                    // Remove any marked text, so normal input can continue.
-                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                // Re-dispatch: run interpretKeyEvents again so the Korean IME
+                // properly calls setMarkedText on the second pass.
+                // Case 1: input source switch detected via keyDown/flagsChanged
+                //         (old_ime_state == Disabled).
+                // Case 2: input source switch was invisible to the app (macOS
+                //         intercepted the key), detected in insertText via
+                //         needs_redispatch flag.
+                let redispatch_detected = self.ivars().needs_redispatch.get();
+                if redispatch_detected
+                    || (self.ivars().ime_state.get() == ImeState::Ground
+                        && old_ime_state == ImeState::Disabled
+                        && !self.ivars().forward_key_to_app.get()
+                        && !unsafe { self.hasMarkedText() })
+                {
+                    self.ivars().needs_redispatch.set(false);
+                    unsafe { self.interpretKeyEvents(&events_for_nsview) };
+                }
+
+                self.ivars().in_key_event.set(false);
+                *self.ivars().preedit_before_key_event.borrow_mut() = String::new();
+                if let Some((string, cursor_range)) =
+                    self.ivars().deferred_preedit.borrow_mut().take()
+                {
+                    self.queue_event(WindowEvent::Ime(Ime::Preedit(string, cursor_range)));
                 }
             }
 
@@ -803,6 +924,10 @@ impl WinitView {
             input_source: Default::default(),
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
+            in_key_event: Default::default(),
+            deferred_preedit: Default::default(),
+            preedit_before_key_event: Default::default(),
+            needs_redispatch: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
