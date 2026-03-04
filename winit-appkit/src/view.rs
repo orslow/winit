@@ -147,6 +147,12 @@ pub struct ViewState {
     /// keyDown nor flagsChanged detected the change).
     needs_redispatch: Cell<bool>,
 
+    /// Deferred commit text from `insertText` during `keyDown`. Emitted
+    /// after `interpretKeyEvents` returns, unless cancelled by a subsequent
+    /// `doCommandBySelector(deleteBackward:)` in the same key event (which
+    /// signals the IME is cancelling composition, not requesting deletion).
+    deferred_commit: RefCell<Option<String>>,
+
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
 
@@ -434,8 +440,16 @@ define_class!(
                     && string.len() > preedit_before.len()
                     && string.starts_with(&preedit_before)
                 {
+                    // Commit splitting: commit the preedit portion, forward
+                    // remaining character as a key event.
                     self.queue_event(WindowEvent::Ime(Ime::Commit(preedit_before)));
                     self.ivars().forward_key_to_app.set(true);
+                } else if self.ivars().in_key_event.get() {
+                    // Defer the commit until after interpretKeyEvents returns.
+                    // If a subsequent doCommandBySelector(deleteBackward:) arrives
+                    // in the same key event, the IME is cancelling composition —
+                    // we cancel the deferred commit instead of emitting it.
+                    *self.ivars().deferred_commit.borrow_mut() = Some(string);
                 } else {
                     self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 }
@@ -487,26 +501,27 @@ define_class!(
             trace_scope!("doCommandBySelector:");
 
             // Don't forward most commands from just committed text (would double-send).
-            // Exception: delete commands must pass through for single jamo backspace.
+            // Exception: delete commands must pass through for single jamo backspace,
+            // UNLESS a deferred commit is pending — that means the IME committed the
+            // last jamo and is now requesting deletion to cancel composition entirely.
+            // In that case, cancel both the commit and the backspace.
             if self.ivars().ime_state.get() == ImeState::Committed {
-                if command == sel!(deleteBackward:)
+                let is_delete = command == sel!(deleteBackward:)
                     || command == sel!(deleteForward:)
                     || command == sel!(deleteWordBackward:)
-                    || command == sel!(deleteWordForward:)
-                {
-                    self.ivars().forward_key_to_app.set(true);
-                }
-                return;
-            }
+                    || command == sel!(deleteWordForward:);
 
-            // If the IME cleared the preedit during this key event (e.g.,
-            // backspace deleting the last composing character), the key was
-            // consumed by the IME. Don't forward it to the application.
-            // See: Ghostty commit e5e89bcbe (issue #7225).
-            if self.ivars().in_key_event.get()
-                && !self.ivars().preedit_before_key_event.borrow().is_empty()
-                && !self.hasMarkedText()
-            {
+                if is_delete {
+                    if self.ivars().deferred_commit.borrow().is_some() {
+                        // IME committed a jamo then asked to delete it — this is
+                        // composition cancellation, not a real backspace. Cancel
+                        // the deferred commit and suppress the delete key.
+                        *self.ivars().deferred_commit.borrow_mut() = None;
+                    } else {
+                        // Normal single jamo backspace (e.g., "ㅇ" then backspace).
+                        self.ivars().forward_key_to_app.set(true);
+                    }
+                }
                 return;
             }
 
@@ -567,6 +582,7 @@ define_class!(
             if self.ivars().ime_capabilities.get().is_some() {
                 self.ivars().in_key_event.set(true);
                 *self.ivars().deferred_preedit.borrow_mut() = None;
+                *self.ivars().deferred_commit.borrow_mut() = None;
                 *self.ivars().preedit_before_key_event.borrow_mut() =
                     self.ivars().marked_text.borrow().string().to_string();
 
@@ -597,6 +613,13 @@ define_class!(
                     self.ivars().deferred_preedit.borrow_mut().take()
                 {
                     self.queue_event(WindowEvent::Ime(Ime::Preedit(string, cursor_range)));
+                }
+                // Emit deferred commit (unless it was cancelled by
+                // doCommandBySelector detecting composition cancellation).
+                if let Some(commit_text) =
+                    self.ivars().deferred_commit.borrow_mut().take()
+                {
+                    self.queue_event(WindowEvent::Ime(Ime::Commit(commit_text)));
                 }
             }
 
@@ -936,6 +959,7 @@ impl WinitView {
             deferred_preedit: Default::default(),
             preedit_before_key_event: Default::default(),
             needs_redispatch: Default::default(),
+            deferred_commit: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
             option_as_alt: Cell::new(option_as_alt),
